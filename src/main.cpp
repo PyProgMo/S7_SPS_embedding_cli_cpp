@@ -13,6 +13,11 @@ constexpr const char *kDefaultIp = "192.168.0.1";
 constexpr int kRack = 0;
 constexpr int kSlot = 1; // S7-1200/1500 always use slot 1 (S7-300/400 use slot 2).
 
+// Onboard digital I/O of a CPU 1214C DC/DC/DC: I0.x-I1.x, Q0.x-Q1.x.
+// Bump these if expansion I/O modules are attached.
+constexpr int kInputBytes = 2;
+constexpr int kOutputBytes = 2;
+
 std::string PrintCliError(int rc) {
     char text[1024] = {0};
     Cli_ErrorText(rc, text, sizeof(text));
@@ -26,23 +31,32 @@ std::string Trim(const std::string &s) {
     return s.substr(begin, end - begin + 1);
 }
 
-void ConnectToPlc(const std::string &ip) {
+// Connects to `ip`, replacing any existing connection held in `client`.
+// Leaves the connection open on success so later menu actions can reuse it.
+bool ConnectToPlc(const std::string &ip, S7Object &client, bool &connected) {
+    if (connected) {
+        Cli_Disconnect(client);
+        Cli_Destroy(&client);
+        connected = false;
+    }
+
     std::printf("\nConnecting to %s (rack %d, slot %d)...\n", ip.c_str(), kRack, kSlot);
 
-    S7Object client = Cli_Create();
+    client = Cli_Create();
     if (client == 0) {
         std::fprintf(stderr, "Cli_Create() failed to allocate a client object.\n");
-        return;
+        return false;
     }
 
     int rc = Cli_ConnectTo(client, ip.c_str(), kRack, kSlot);
     if (rc != 0) {
         std::fprintf(stderr, "Connection failed: %s\n", PrintCliError(rc).c_str());
         Cli_Destroy(&client);
-        return;
+        return false;
     }
 
     std::printf("Connected.\n");
+    connected = true;
 
     TS7CpuInfo cpuInfo{};
     rc = Cli_GetCpuInfo(client, &cpuInfo);
@@ -65,8 +79,111 @@ void ConnectToPlc(const std::string &ip) {
         std::fprintf(stderr, "Cli_GetOrderCode() failed: %s\n", PrintCliError(rc).c_str());
     }
 
-    Cli_Disconnect(client);
-    Cli_Destroy(&client);
+    return true;
+}
+
+// Parses an address like "Q0.3" (the leading 'Q' is optional) into byte/bit.
+bool ParseIoAddress(const std::string &raw, int &byteIdx, int &bitIdx) {
+    std::string s = Trim(raw);
+    if (!s.empty() && (s[0] == 'Q' || s[0] == 'q')) {
+        s = s.substr(1);
+    }
+    size_t dot = s.find('.');
+    if (dot == std::string::npos) return false;
+
+    try {
+        byteIdx = std::stoi(s.substr(0, dot));
+        bitIdx = std::stoi(s.substr(dot + 1));
+    } catch (...) {
+        return false;
+    }
+    return byteIdx >= 0 && bitIdx >= 0 && bitIdx <= 7;
+}
+
+// Reads and prints the state of every onboard digital input and output.
+void ShowPortStates(S7Object client) {
+    unsigned char inputs[kInputBytes] = {0};
+    int rc = Cli_ReadArea(client, S7AreaPE, 0, 0, kInputBytes, S7WLByte, inputs);
+    if (rc != 0) {
+        std::fprintf(stderr, "Failed to read inputs: %s\n", PrintCliError(rc).c_str());
+    } else {
+        std::printf("\nDigital inputs:\n");
+        for (int b = 0; b < kInputBytes; ++b) {
+            for (int bit = 0; bit < 8; ++bit) {
+                bool state = (inputs[b] >> bit) & 1;
+                std::printf("  I%d.%d = %s\n", b, bit, state ? "True" : "False");
+            }
+        }
+    }
+
+    unsigned char outputs[kOutputBytes] = {0};
+    rc = Cli_ReadArea(client, S7AreaPA, 0, 0, kOutputBytes, S7WLByte, outputs);
+    if (rc != 0) {
+        std::fprintf(stderr, "Failed to read outputs: %s\n", PrintCliError(rc).c_str());
+        return;
+    }
+    std::printf("\nDigital outputs:\n");
+    for (int b = 0; b < kOutputBytes; ++b) {
+        for (int bit = 0; bit < 8; ++bit) {
+            bool state = (outputs[b] >> bit) & 1;
+            std::printf("  Q%d.%d = %s\n", b, bit, state ? "True" : "False");
+        }
+    }
+}
+
+// Prompts for an output address and a new value, then writes it via a
+// read-modify-write on the containing byte so neighbouring bits are untouched.
+void SetOutputPort(S7Object client) {
+    std::printf("\nEnter output to set, e.g. Q0.3 (blank to cancel): ");
+    std::string line;
+    if (!std::getline(std::cin, line)) return;
+    line = Trim(line);
+    if (line.empty()) return;
+
+    int byteIdx = 0, bitIdx = 0;
+    if (!ParseIoAddress(line, byteIdx, bitIdx)) {
+        std::printf("Invalid address. Use the form Q<byte>.<bit>, e.g. Q0.3.\n");
+        return;
+    }
+    if (byteIdx >= kOutputBytes) {
+        std::printf("Byte %d is out of range for this CPU's onboard outputs (Q0-Q%d).\n",
+                    byteIdx, kOutputBytes - 1);
+        return;
+    }
+
+    std::printf("Set Q%d.%d to (1=True, 0=False): ", byteIdx, bitIdx);
+    if (!std::getline(std::cin, line)) return;
+    line = Trim(line);
+    bool value;
+    if (line == "1" || line == "true" || line == "True") {
+        value = true;
+    } else if (line == "0" || line == "false" || line == "False") {
+        value = false;
+    } else {
+        std::printf("Invalid value.\n");
+        return;
+    }
+
+    unsigned char byteVal = 0;
+    int rc = Cli_ReadArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &byteVal);
+    if (rc != 0) {
+        std::fprintf(stderr, "Failed to read output byte: %s\n", PrintCliError(rc).c_str());
+        return;
+    }
+
+    if (value) {
+        byteVal |= static_cast<unsigned char>(1 << bitIdx);
+    } else {
+        byteVal &= static_cast<unsigned char>(~(1 << bitIdx));
+    }
+
+    rc = Cli_WriteArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &byteVal);
+    if (rc != 0) {
+        std::fprintf(stderr, "Failed to write output: %s\n", PrintCliError(rc).c_str());
+        return;
+    }
+
+    std::printf("Q%d.%d set to %s.\n", byteIdx, bitIdx, value ? "True" : "False");
 }
 
 // Runs a PROFINET DCP Identify-All scan (same discovery PRONETA's network
@@ -157,16 +274,22 @@ void RunNetworkScan(std::string &ip) {
     std::printf("PLC IP set to %s.\n", ip.c_str());
 }
 
-void PrintMenu(const std::string &ip) {
+void PrintMenu(const std::string &ip, bool connected) {
     std::printf("\n"
                 "==== SPScomm ====\n"
                 "Current PLC IP : %s\n"
+                "Connection     : %s\n"
                 "  1) Set PLC IP address\n"
                 "  2) Scan / connect\n"
                 "  3) Scan network for PROFINET devices\n"
+                "  4) Show I/O port states%s\n"
+                "  5) Set an output port (True/False)%s\n"
                 "  0) Exit\n"
                 "Choice: ",
-                ip.c_str());
+                ip.c_str(),
+                connected ? "connected" : "not connected",
+                connected ? "" : "  (connect first)",
+                connected ? "" : "  (connect first)");
 }
 
 } // namespace
@@ -174,9 +297,12 @@ void PrintMenu(const std::string &ip) {
 int main(int argc, char *argv[]) {
     std::string ip = (argc > 1) ? argv[1] : kDefaultIp;
 
+    S7Object client = 0;
+    bool connected = false;
+
     std::string line;
     while (true) {
-        PrintMenu(ip);
+        PrintMenu(ip, connected);
         if (!std::getline(std::cin, line)) {
             break; // stdin closed (e.g. EOF)
         }
@@ -192,14 +318,31 @@ int main(int argc, char *argv[]) {
                 std::printf("IP unchanged.\n");
             }
         } else if (line == "2") {
-            ConnectToPlc(ip);
+            ConnectToPlc(ip, client, connected);
         } else if (line == "3") {
             RunNetworkScan(ip);
+        } else if (line == "4") {
+            if (!connected) {
+                std::printf("Not connected -- use option 2 first.\n");
+            } else {
+                ShowPortStates(client);
+            }
+        } else if (line == "5") {
+            if (!connected) {
+                std::printf("Not connected -- use option 2 first.\n");
+            } else {
+                SetOutputPort(client);
+            }
         } else if (line == "0" || line == "q" || line == "quit" || line == "exit") {
             break;
         } else {
             std::printf("Invalid choice.\n");
         }
+    }
+
+    if (connected) {
+        Cli_Disconnect(client);
+        Cli_Destroy(&client);
     }
 
     return 0;

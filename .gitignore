@@ -1,0 +1,40 @@
+# --- Build output (CMake/Ninja) ---------------------------------------
+# Everyone builds locally with build.sh / cmake --build; nothing compiled
+# ships in the repo.
+build/
+out/
+
+# --- C/C++ compiled artifacts --------------------------------------------
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.a
+*.pdb
+*.ilk
+*.exp
+# (third_party/ vendored binaries, e.g. snap7's prebuilt .dll/.dll.a, are
+# intentionally NOT covered here since they're dependencies, not build output)
+
+# --- Python compiled/cache artifacts --------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Python virtual environments -------------------------------------------
+.venv/
+venv/
+env/
+
+# --- Editor / OS cruft ------------------------------------------------------
+.vs/
+.vscode/*
+!.vscode/extensions.json
+Thumbs.db
+Desktop.ini
