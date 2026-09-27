@@ -5,6 +5,7 @@
 #include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 
 #include <direct.h> // _mkdir (MinGW/Windows)
@@ -13,13 +14,16 @@ namespace logger {
 
 namespace {
 std::ofstream g_file;
+// Guards g_file and the std::localtime static buffer -- Log() is now called
+// from both the main thread and the background channel-program thread.
+std::mutex g_mutex;
 
 std::string Timestamp(const char *fileNameSafeSeparator = nullptr) {
     using namespace std::chrono;
     auto now = system_clock::now();
     auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
     std::time_t t = system_clock::to_time_t(now);
-    std::tm tmBuf = *std::localtime(&t); // single-threaded app -- no reentrancy issue
+    std::tm tmBuf = *std::localtime(&t); // caller must hold g_mutex
 
     std::ostringstream oss;
     if (fileNameSafeSeparator) {
@@ -33,6 +37,8 @@ std::string Timestamp(const char *fileNameSafeSeparator = nullptr) {
 } // namespace
 
 void Init(const std::string &logDir) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
     _mkdir(logDir.c_str()); // ignores EEXIST; failure just means Log() writes go nowhere
 
     std::string path = logDir + "/spscomm_" + Timestamp("file") + ".log";
@@ -47,6 +53,7 @@ void Init(const std::string &logDir) {
 }
 
 void Log(const std::string &line) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_file.is_open()) return;
     g_file << Timestamp() << "  " << line << '\n';
     g_file.flush(); // so a killed/crashed process still leaves a usable log
@@ -65,6 +72,7 @@ std::string Hex(const unsigned char *data, int len) {
 }
 
 void Close() {
+    std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file.is_open()) {
         g_file << "==== SPScomm traffic log ended " << Timestamp() << " ====\n";
         g_file.close();

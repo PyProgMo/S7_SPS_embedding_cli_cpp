@@ -1,7 +1,9 @@
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "snap7.h"
@@ -38,6 +40,65 @@ std::string Trim(const std::string &s) {
     if (begin == std::string::npos) return "";
     size_t end = s.find_last_not_of(" \t\r\n");
     return s.substr(begin, end - begin + 1);
+}
+
+std::string CpuStatusText(int status) {
+    switch (status) {
+        case S7CpuStatusRun: return "RUN";
+        case S7CpuStatusStop: return "STOP";
+        default: return "UNKNOWN";
+    }
+}
+
+// Stops the CPU's own resident user program (Cli_PlcStop). This is a real
+// CPU-level STOP, distinct from our own external channel-program loop below:
+// while stopped, output drivers are disabled entirely, so nothing -- not
+// even our external writes -- can drive physical outputs until the CPU is
+// started again.
+void StopCpu(S7Object client) {
+    int status = S7CpuStatusUnknown;
+    Cli_GetPlcStatus(client, &status);
+    std::printf("\nCurrent CPU status: %s\n", CpuStatusText(status).c_str());
+    logger::Log("PLC_STOP -> current_status=" + CpuStatusText(status));
+
+    int rc = Cli_PlcStop(client);
+    logger::Log("PLC_STOP <- rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
+    if (rc != 0) {
+        std::fprintf(stderr, "Failed to stop CPU: %s\n", PrintCliError(rc).c_str());
+        return;
+    }
+
+    std::printf("CPU stop requested. This halts whatever user program is currently\n"
+                "running on it -- outputs will drop to their configured safe state and\n"
+                "cannot be driven externally until the CPU is running again.\n");
+}
+
+// Resumes the CPU's own resident user program with a warm (hot) restart,
+// which preserves retained data. Use Cli_PlcColdStart instead if you
+// specifically need a cold restart -- not exposed here since it resets
+// retentive memory and isn't what you want for routine testing.
+void StartCpu(S7Object client) {
+    int status = S7CpuStatusUnknown;
+    Cli_GetPlcStatus(client, &status);
+    std::printf("\nCurrent CPU status: %s\n", CpuStatusText(status).c_str());
+    logger::Log("PLC_START -> current_status=" + CpuStatusText(status));
+
+    if (status == S7CpuStatusRun) {
+        std::printf("CPU is already running.\n");
+        return;
+    }
+
+    int rc = Cli_PlcHotStart(client);
+    logger::Log("PLC_START <- rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
+    if (rc != 0) {
+        std::fprintf(stderr, "Hot start failed: %s\n", PrintCliError(rc).c_str());
+        return;
+    }
+
+    Sleep(500); // give the CPU a moment to come up before checking
+    Cli_GetPlcStatus(client, &status);
+    std::printf("CPU status after start: %s\n", CpuStatusText(status).c_str());
+    logger::Log("PLC_START result status=" + CpuStatusText(status));
 }
 
 // Connects to `ip`, replacing any existing connection held in `client`.
@@ -328,152 +389,137 @@ void SetOutputPort(S7Object client) {
     }
 }
 
-// Applies every channel state from a parsed program file: writes each one,
-// then (if holdSeconds > 0) repeatedly re-asserts all of them together while
-// tracking how often each one actually holds -- the multi-channel version of
-// the same interference check HoldAndMonitor does for a single bit. There is
-// still no genuine "force" here (see HoldAndMonitor's comment); this is
-// meant to reveal, per channel, which ones are free to set and which are
-// being fought by something already running on the CPU.
-void RunChannelProgram(S7Object client, const std::vector<ChannelState> &states, double holdSeconds) {
-    std::printf("\nApplying %zu channel state(s):\n", states.size());
-    logger::Log("PROGRAM -> applying " + std::to_string(states.size()) +
-                " channel state(s), hold_s=" + std::to_string(holdSeconds));
-
-    for (const auto &st : states) {
-        if (st.byteIdx >= kOutputBytes) {
-            std::printf("  %-8s SKIPPED (byte %d out of range for this CPU's outputs Q0-Q%d)\n",
-                        st.rawAddress.c_str(), st.byteIdx, kOutputBytes - 1);
-            logger::Log("PROGRAM SKIP " + st.rawAddress + " out of range");
-            continue;
-        }
-
-        unsigned char byteVal = 0;
-        int rc = Cli_ReadArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &byteVal);
-        if (rc != 0) {
-            std::printf("  %-8s FAILED to read (%s)\n", st.rawAddress.c_str(), PrintCliError(rc).c_str());
-            logger::Log("PROGRAM " + st.rawAddress + " read-before rc=" + std::to_string(rc));
-            continue;
-        }
-
-        unsigned char newByteVal = byteVal;
-        if (st.value) {
-            newByteVal |= static_cast<unsigned char>(1 << st.bitIdx);
-        } else {
-            newByteVal &= static_cast<unsigned char>(~(1 << st.bitIdx));
-        }
-
-        rc = Cli_WriteArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &newByteVal);
-        logger::Log("PROGRAM WRITE " + st.rawAddress + "=" + (st.value ? "True" : "False") +
-                    " old=[" + logger::Hex(&byteVal, 1) + "] new=[" + logger::Hex(&newByteVal, 1) +
-                    "] rc=" + std::to_string(rc));
-        if (rc != 0) {
-            std::printf("  %-8s FAILED to write (%s)\n", st.rawAddress.c_str(), PrintCliError(rc).c_str());
-            continue;
-        }
-        std::printf("  %-8s = %-5s written\n", st.rawAddress.c_str(), st.value ? "True" : "False");
-    }
-
-    if (holdSeconds <= 0.0) {
-        std::printf("\nDone (single pass, no hold). Use option 4 to check the resulting states,\n"
-                    "or re-run with a hold duration if a value doesn't stick.\n");
-        return;
-    }
-
-    std::printf("\nHolding and re-asserting all %zu channel(s) for %.1fs...\n",
-                states.size(), holdSeconds);
-    logger::Log("PROGRAM HOLD -> " + std::to_string(states.size()) + " channel(s) for " +
-                std::to_string(holdSeconds) + "s");
-
-    std::vector<long> matches(states.size(), 0);
-    long attempts = 0;
-    const auto start = std::chrono::steady_clock::now();
-    auto lastPrint = start;
-
-    while (true) {
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - start).count();
-        if (elapsed >= holdSeconds) break;
-
-        ++attempts;
-        for (size_t i = 0; i < states.size(); ++i) {
-            const ChannelState &st = states[i];
-            if (st.byteIdx >= kOutputBytes) continue;
-
-            unsigned char byteVal = 0;
-            int rc = Cli_ReadArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &byteVal);
-            if (rc == 0) {
-                unsigned char newByteVal = byteVal;
-                if (st.value) {
-                    newByteVal |= static_cast<unsigned char>(1 << st.bitIdx);
-                } else {
-                    newByteVal &= static_cast<unsigned char>(~(1 << st.bitIdx));
-                }
-                rc = Cli_WriteArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &newByteVal);
-            }
-
-            unsigned char verifyVal = 0;
-            int vrc = Cli_ReadArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &verifyVal);
-            bool matched = (rc == 0) && (vrc == 0) &&
-                           (static_cast<bool>((verifyVal >> st.bitIdx) & 1) == st.value);
-            if (matched) ++matches[i];
-        }
-
-        now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - lastPrint).count() >= 1.0) {
-            std::printf("  %.0fs elapsed, %ld pass(es) so far\n", elapsed, attempts);
-            lastPrint = now;
-        }
-
-        Sleep(50);
-    }
-
-    std::printf("\nHold finished after %ld pass(es):\n", attempts);
-    for (size_t i = 0; i < states.size(); ++i) {
-        double pct = attempts ? 100.0 * matches[i] / attempts : 0.0;
-        std::printf("  %-8s = %-5s held %.1f%% of checks%s\n",
-                    states[i].rawAddress.c_str(), states[i].value ? "True" : "False", pct,
-                    pct < 50.0 ? "  <-- likely overridden by a running program" : "");
-        logger::Log("PROGRAM HOLD RESULT " + states[i].rawAddress + " matches=" +
-                    std::to_string(matches[i]) + "/" + std::to_string(attempts));
-    }
-}
-
-// Prompts for a program file path and hold duration, loads it, and runs it.
-void RunProgramFromFile(S7Object client) {
+// Prompts for a program file path, parses it, and stores the result in
+// `states`/`path` (replacing whatever was loaded before). Doesn't need a PLC
+// connection -- it's just a local file.
+void LoadProgramFromFile(std::vector<ChannelState> &states, std::string &path) {
     std::printf("\nProgram file path [program.txt]: ");
     std::string line;
     if (!std::getline(std::cin, line)) return;
     line = Trim(line);
-    std::string path = line.empty() ? "program.txt" : line;
+    std::string requestedPath = line.empty() ? "program.txt" : line;
 
-    std::vector<ChannelState> states;
+    std::vector<ChannelState> parsed;
     std::string error;
-    if (!ParseChannelProgram(path, states, error)) {
+    if (!ParseChannelProgram(requestedPath, parsed, error)) {
         std::printf("Failed to load program: %s\n", error.c_str());
-        logger::Log("PROGRAM LOAD FAILED path=" + path + " error=" + error);
+        logger::Log("PROGRAM LOAD FAILED path=" + requestedPath + " error=" + error);
         return;
     }
+
+    states = std::move(parsed);
+    path = requestedPath;
 
     std::printf("Loaded %zu channel state(s) from %s:\n", states.size(), path.c_str());
     for (const auto &st : states) {
         std::printf("  %s = %s\n", st.rawAddress.c_str(), st.value ? "True" : "False");
     }
     logger::Log("PROGRAM LOAD OK path=" + path + " count=" + std::to_string(states.size()));
+}
 
-    std::printf("\nHold/re-assert duration in seconds (0 = apply once, no hold) [10]: ");
-    if (!std::getline(std::cin, line)) return;
-    line = Trim(line);
-    double holdSeconds = 10.0;
-    if (!line.empty()) {
-        try {
-            holdSeconds = std::stod(line);
-        } catch (...) {
-            std::printf("Invalid duration, using 10s.\n");
-        }
+// Runs on a background thread once a program is started. Uses its own S7
+// connection (separate from the interactive menu's) so it never contends
+// with option 4/5 calls on the shared client. Every ~100ms it re-writes and
+// reads back every channel; every ~5s it logs a per-channel hold percentage
+// so `logs/` records exactly how much interference each channel saw over
+// the whole run, not just a snapshot. Stops as soon as `running` goes false.
+void ProgramLoop(std::string ip, std::vector<ChannelState> states, std::atomic<bool> *running) {
+    S7Object client = Cli_Create();
+    int rc = Cli_ConnectTo(client, ip.c_str(), kRack, kSlot);
+    logger::Log("PROGRAM_THREAD connect rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
+    if (rc != 0) {
+        Cli_Destroy(&client);
+        running->store(false);
+        return;
     }
 
-    RunChannelProgram(client, states, holdSeconds);
+    std::vector<long> matches(states.size(), 0);
+    long attempts = 0;
+    auto lastLog = std::chrono::steady_clock::now();
+
+    while (running->load()) {
+        ++attempts;
+        for (size_t i = 0; i < states.size(); ++i) {
+            const ChannelState &st = states[i];
+            if (st.byteIdx >= kOutputBytes) continue;
+
+            unsigned char byteVal = 0;
+            int rrc = Cli_ReadArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &byteVal);
+            if (rrc == 0) {
+                unsigned char newByteVal = byteVal;
+                if (st.value) {
+                    newByteVal |= static_cast<unsigned char>(1 << st.bitIdx);
+                } else {
+                    newByteVal &= static_cast<unsigned char>(~(1 << st.bitIdx));
+                }
+                Cli_WriteArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &newByteVal);
+            }
+
+            unsigned char verifyVal = 0;
+            int vrc = Cli_ReadArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &verifyVal);
+            bool matched = (vrc == 0) &&
+                           (static_cast<bool>((verifyVal >> st.bitIdx) & 1) == st.value);
+            if (matched) ++matches[i];
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - lastLog).count() >= 5.0) {
+            std::string summary = "PROGRAM_THREAD status attempts=" + std::to_string(attempts);
+            for (size_t i = 0; i < states.size(); ++i) {
+                double pct = attempts ? 100.0 * matches[i] / attempts : 0.0;
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), " %s=%.0f%%", states[i].rawAddress.c_str(), pct);
+                summary += buf;
+            }
+            logger::Log(summary);
+            lastLog = now;
+        }
+
+        Sleep(100);
+    }
+
+    logger::Log("PROGRAM_THREAD stopped after " + std::to_string(attempts) + " pass(es)");
+    Cli_Disconnect(client);
+    Cli_Destroy(&client);
+}
+
+// Starts the currently loaded program on its own background connection.
+void StartProgram(const std::string &ip, const std::vector<ChannelState> &states,
+                   const std::string &path, std::thread &programThread,
+                   std::atomic<bool> &programRunning) {
+    if (states.empty()) {
+        std::printf("\nNo program loaded -- use the load option first.\n");
+        return;
+    }
+    if (programRunning.load()) {
+        std::printf("\nA program is already running -- stop it first.\n");
+        return;
+    }
+
+    std::printf("\nStarting program %s (%zu channel(s)) in the background...\n",
+                path.c_str(), states.size());
+    logger::Log("PROGRAM START path=" + path + " count=" + std::to_string(states.size()));
+
+    programRunning.store(true);
+    programThread = std::thread(ProgramLoop, ip, states, &programRunning);
+
+    std::printf("Running. Use the stop option to end it; check logs/ for the ongoing\n"
+                "per-channel hold percentages while it runs.\n");
+}
+
+// Stops a running program, if any, and joins its thread.
+void StopProgram(std::thread &programThread, std::atomic<bool> &programRunning) {
+    if (!programRunning.load() && !programThread.joinable()) {
+        std::printf("\nNo program is running.\n");
+        return;
+    }
+
+    std::printf("\nStopping program...\n");
+    programRunning.store(false);
+    if (programThread.joinable()) {
+        programThread.join();
+    }
+    std::printf("Stopped.\n");
 }
 
 // Runs a PROFINET DCP Identify-All scan (same discovery PRONETA's network
@@ -564,21 +610,32 @@ void RunNetworkScan(std::string &ip) {
     std::printf("PLC IP set to %s.\n", ip.c_str());
 }
 
-void PrintMenu(const std::string &ip, bool connected) {
+void PrintMenu(const std::string &ip, bool connected, const std::string &programPath,
+               bool programRunning) {
     std::printf("\n"
                 "==== SPScomm ====\n"
                 "Current PLC IP : %s\n"
                 "Connection     : %s\n"
+                "Loaded program : %s\n"
+                "Program status : %s\n"
                 "  1) Set PLC IP address\n"
                 "  2) Scan / connect\n"
                 "  3) Scan network for PROFINET devices\n"
                 "  4) Show I/O port states%s\n"
                 "  5) Set an output port (True/False)%s\n"
-                "  6) Load & run a channel-state program (.txt)%s\n"
+                "  6) Load a channel-state program (.txt)\n"
+                "  7) Start loaded program%s\n"
+                "  8) Stop running program\n"
+                "  9) Stop CPU (halts its own user program)%s\n"
+                " 10) Start CPU (resumes its own user program)%s\n"
                 "  0) Exit\n"
                 "Choice: ",
                 ip.c_str(),
                 connected ? "connected" : "not connected",
+                programPath.empty() ? "(none)" : programPath.c_str(),
+                programRunning ? "running" : "stopped",
+                connected ? "" : "  (connect first)",
+                connected ? "" : "  (connect first)",
                 connected ? "" : "  (connect first)",
                 connected ? "" : "  (connect first)",
                 connected ? "" : "  (connect first)");
@@ -594,9 +651,14 @@ int main(int argc, char *argv[]) {
     S7Object client = 0;
     bool connected = false;
 
+    std::vector<ChannelState> loadedProgram;
+    std::string loadedProgramPath;
+    std::thread programThread;
+    std::atomic<bool> programRunning{false};
+
     std::string line;
     while (true) {
-        PrintMenu(ip, connected);
+        PrintMenu(ip, connected, loadedProgramPath, programRunning.load());
         if (!std::getline(std::cin, line)) {
             break; // stdin closed (e.g. EOF)
         }
@@ -612,6 +674,10 @@ int main(int argc, char *argv[]) {
                 std::printf("IP unchanged.\n");
             }
         } else if (line == "2") {
+            if (programRunning.load()) {
+                std::printf("Stopping the running program before reconnecting...\n");
+                StopProgram(programThread, programRunning);
+            }
             ConnectToPlc(ip, client, connected);
         } else if (line == "3") {
             RunNetworkScan(ip);
@@ -628,16 +694,36 @@ int main(int argc, char *argv[]) {
                 SetOutputPort(client);
             }
         } else if (line == "6") {
+            LoadProgramFromFile(loadedProgram, loadedProgramPath);
+        } else if (line == "7") {
             if (!connected) {
                 std::printf("Not connected -- use option 2 first.\n");
             } else {
-                RunProgramFromFile(client);
+                StartProgram(ip, loadedProgram, loadedProgramPath, programThread, programRunning);
+            }
+        } else if (line == "8") {
+            StopProgram(programThread, programRunning);
+        } else if (line == "9") {
+            if (!connected) {
+                std::printf("Not connected -- use option 2 first.\n");
+            } else {
+                StopCpu(client);
+            }
+        } else if (line == "10") {
+            if (!connected) {
+                std::printf("Not connected -- use option 2 first.\n");
+            } else {
+                StartCpu(client);
             }
         } else if (line == "0" || line == "q" || line == "quit" || line == "exit") {
             break;
         } else {
             std::printf("Invalid choice.\n");
         }
+    }
+
+    if (programRunning.load() || programThread.joinable()) {
+        StopProgram(programThread, programRunning);
     }
 
     if (connected) {
