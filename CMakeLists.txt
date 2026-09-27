@@ -28,6 +28,7 @@ add_executable(SPScomm
     src/main.cpp
     src/npcap_dyn.cpp
     src/profinet_scan.cpp
+    src/logger.cpp
 )
 
 target_include_directories(SPScomm PRIVATE ${SNAP7_INCLUDE_DIR} ${NPCAP_SDK_INCLUDE_DIR})

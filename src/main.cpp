@@ -6,6 +6,7 @@
 #include "snap7.h"
 #include "npcap_dyn.h"
 #include "profinet_scan.h"
+#include "logger.h"
 
 namespace {
 
@@ -35,20 +36,25 @@ std::string Trim(const std::string &s) {
 // Leaves the connection open on success so later menu actions can reuse it.
 bool ConnectToPlc(const std::string &ip, S7Object &client, bool &connected) {
     if (connected) {
+        logger::Log("DISCONNECT (reconnecting)");
         Cli_Disconnect(client);
         Cli_Destroy(&client);
         connected = false;
     }
 
     std::printf("\nConnecting to %s (rack %d, slot %d)...\n", ip.c_str(), kRack, kSlot);
+    logger::Log("CONNECT -> ip=" + ip + " rack=" + std::to_string(kRack) +
+                " slot=" + std::to_string(kSlot));
 
     client = Cli_Create();
     if (client == 0) {
         std::fprintf(stderr, "Cli_Create() failed to allocate a client object.\n");
+        logger::Log("CONNECT <- Cli_Create() returned a null object");
         return false;
     }
 
     int rc = Cli_ConnectTo(client, ip.c_str(), kRack, kSlot);
+    logger::Log("CONNECT <- rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
     if (rc != 0) {
         std::fprintf(stderr, "Connection failed: %s\n", PrintCliError(rc).c_str());
         Cli_Destroy(&client);
@@ -59,6 +65,7 @@ bool ConnectToPlc(const std::string &ip, S7Object &client, bool &connected) {
     connected = true;
 
     TS7CpuInfo cpuInfo{};
+    logger::Log("GET_CPU_INFO ->");
     rc = Cli_GetCpuInfo(client, &cpuInfo);
     if (rc == 0) {
         std::printf("Module type : %s\n", cpuInfo.ModuleTypeName);
@@ -66,17 +73,25 @@ bool ConnectToPlc(const std::string &ip, S7Object &client, bool &connected) {
         std::printf("Serial no.  : %s\n", cpuInfo.SerialNumber);
         std::printf("AS name     : %s\n", cpuInfo.ASName);
         std::printf("Copyright   : %s\n", cpuInfo.Copyright);
+        logger::Log("GET_CPU_INFO <- rc=0 module=" + std::string(cpuInfo.ModuleTypeName) +
+                    " serial=" + std::string(cpuInfo.SerialNumber));
     } else {
         std::fprintf(stderr, "Cli_GetCpuInfo() failed: %s\n", PrintCliError(rc).c_str());
+        logger::Log("GET_CPU_INFO <- rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
     }
 
     TS7OrderCode orderCode{};
+    logger::Log("GET_ORDER_CODE ->");
     rc = Cli_GetOrderCode(client, &orderCode);
     if (rc == 0) {
         std::printf("Order code  : %s (V%d.%d.%d)\n",
                     orderCode.Code, orderCode.V1, orderCode.V2, orderCode.V3);
+        logger::Log("GET_ORDER_CODE <- rc=0 code=" + std::string(orderCode.Code) +
+                    " v=" + std::to_string(orderCode.V1) + "." + std::to_string(orderCode.V2) +
+                    "." + std::to_string(orderCode.V3));
     } else {
         std::fprintf(stderr, "Cli_GetOrderCode() failed: %s\n", PrintCliError(rc).c_str());
+        logger::Log("GET_ORDER_CODE <- rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
     }
 
     return true;
@@ -103,10 +118,13 @@ bool ParseIoAddress(const std::string &raw, int &byteIdx, int &bitIdx) {
 // Reads and prints the state of every onboard digital input and output.
 void ShowPortStates(S7Object client) {
     unsigned char inputs[kInputBytes] = {0};
+    logger::Log("READ -> area=PE start=0 amount=" + std::to_string(kInputBytes));
     int rc = Cli_ReadArea(client, S7AreaPE, 0, 0, kInputBytes, S7WLByte, inputs);
     if (rc != 0) {
         std::fprintf(stderr, "Failed to read inputs: %s\n", PrintCliError(rc).c_str());
+        logger::Log("READ <- area=PE rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
     } else {
+        logger::Log("READ <- area=PE rc=0 data=[" + logger::Hex(inputs, kInputBytes) + "]");
         std::printf("\nDigital inputs:\n");
         for (int b = 0; b < kInputBytes; ++b) {
             for (int bit = 0; bit < 8; ++bit) {
@@ -117,11 +135,14 @@ void ShowPortStates(S7Object client) {
     }
 
     unsigned char outputs[kOutputBytes] = {0};
+    logger::Log("READ -> area=PA start=0 amount=" + std::to_string(kOutputBytes));
     rc = Cli_ReadArea(client, S7AreaPA, 0, 0, kOutputBytes, S7WLByte, outputs);
     if (rc != 0) {
         std::fprintf(stderr, "Failed to read outputs: %s\n", PrintCliError(rc).c_str());
+        logger::Log("READ <- area=PA rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
         return;
     }
+    logger::Log("READ <- area=PA rc=0 data=[" + logger::Hex(outputs, kOutputBytes) + "]");
     std::printf("\nDigital outputs:\n");
     for (int b = 0; b < kOutputBytes; ++b) {
         for (int bit = 0; bit < 8; ++bit) {
@@ -165,25 +186,59 @@ void SetOutputPort(S7Object client) {
     }
 
     unsigned char byteVal = 0;
+    logger::Log("WRITE -> read-before area=PA start=" + std::to_string(byteIdx) + " amount=1");
     int rc = Cli_ReadArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &byteVal);
+    logger::Log("WRITE <- read-before rc=" + std::to_string(rc) + " (" + PrintCliError(rc) +
+                ") data=[" + logger::Hex(&byteVal, 1) + "]");
     if (rc != 0) {
         std::fprintf(stderr, "Failed to read output byte: %s\n", PrintCliError(rc).c_str());
         return;
     }
 
+    unsigned char newByteVal = byteVal;
     if (value) {
-        byteVal |= static_cast<unsigned char>(1 << bitIdx);
+        newByteVal |= static_cast<unsigned char>(1 << bitIdx);
     } else {
-        byteVal &= static_cast<unsigned char>(~(1 << bitIdx));
+        newByteVal &= static_cast<unsigned char>(~(1 << bitIdx));
     }
 
-    rc = Cli_WriteArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &byteVal);
+    logger::Log("WRITE -> area=PA start=" + std::to_string(byteIdx) + " bit=" +
+                std::to_string(bitIdx) + " value=" + (value ? "True" : "False") +
+                " old_byte=[" + logger::Hex(&byteVal, 1) + "] new_byte=[" +
+                logger::Hex(&newByteVal, 1) + "]");
+    rc = Cli_WriteArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &newByteVal);
+    logger::Log("WRITE <- rc=" + std::to_string(rc) + " (" + PrintCliError(rc) + ")");
     if (rc != 0) {
         std::fprintf(stderr, "Failed to write output: %s\n", PrintCliError(rc).c_str());
         return;
     }
 
-    std::printf("Q%d.%d set to %s.\n", byteIdx, bitIdx, value ? "True" : "False");
+    // Read the byte back immediately so a silent revert (e.g. a running
+    // program overwriting this output on its own scan cycle, or the CPU's
+    // protection level quietly rejecting the write) shows up here instead
+    // of only being noticed later.
+    unsigned char verifyVal = 0;
+    logger::Log("VERIFY -> read-after area=PA start=" + std::to_string(byteIdx) + " amount=1");
+    rc = Cli_ReadArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &verifyVal);
+    logger::Log("VERIFY <- rc=" + std::to_string(rc) + " (" + PrintCliError(rc) +
+                ") data=[" + logger::Hex(&verifyVal, 1) + "]");
+
+    bool actual = (verifyVal >> bitIdx) & 1;
+    if (rc == 0 && actual == value) {
+        std::printf("Q%d.%d set to %s (confirmed by read-back).\n",
+                    byteIdx, bitIdx, value ? "True" : "False");
+    } else if (rc != 0) {
+        std::fprintf(stderr, "Wrote Q%d.%d but could not verify: %s\n",
+                    byteIdx, bitIdx, PrintCliError(rc).c_str());
+    } else {
+        std::printf("WARNING: wrote Q%d.%d = %s, but it reads back as %s.\n",
+                    byteIdx, bitIdx, value ? "True" : "False", actual ? "True" : "False");
+        std::printf("Something is reverting it -- likely a running user program driving this\n"
+                    "output every scan cycle, or the CPU's protection level rejecting external\n"
+                    "writes. Check logs/ for the exact request/response sequence.\n");
+        logger::Log("WRITE MISMATCH: requested=" + std::string(value ? "True" : "False") +
+                    " actual=" + std::string(actual ? "True" : "False"));
+    }
 }
 
 // Runs a PROFINET DCP Identify-All scan (same discovery PRONETA's network
@@ -295,6 +350,8 @@ void PrintMenu(const std::string &ip, bool connected) {
 } // namespace
 
 int main(int argc, char *argv[]) {
+    logger::Init();
+
     std::string ip = (argc > 1) ? argv[1] : kDefaultIp;
 
     S7Object client = 0;
@@ -341,9 +398,11 @@ int main(int argc, char *argv[]) {
     }
 
     if (connected) {
+        logger::Log("DISCONNECT");
         Cli_Disconnect(client);
         Cli_Destroy(&client);
     }
 
+    logger::Close();
     return 0;
 }
