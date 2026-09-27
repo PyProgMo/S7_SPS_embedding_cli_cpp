@@ -13,3 +13,6 @@ cmake --build "$BUILD_DIR"
 
 echo
 echo "Built: $BUILD_DIR/SPScomm.exe"
+
+# cp program.txt into the same dir as the .exe file
+mv program.txt ./build/.

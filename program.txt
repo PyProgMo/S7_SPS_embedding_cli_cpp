@@ -1,0 +1,21 @@
+# SPScomm channel-state program
+# One channel per line: <address>=<True|False|1|0>
+# Address form: Q<byte>.<bit>  (only outputs can be written)
+#
+# All channels off except Q0.0.
+Q0.0=True
+Q0.1=False
+Q0.2=False
+Q0.3=False
+Q0.4=False
+Q0.5=False
+Q0.6=False
+Q0.7=False
+Q1.0=False
+Q1.1=False
+Q1.2=False
+Q1.3=False
+Q1.4=False
+Q1.5=False
+Q1.6=False
+Q1.7=False

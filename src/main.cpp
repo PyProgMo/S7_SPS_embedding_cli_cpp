@@ -1,12 +1,20 @@
+#include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <string>
 #include <vector>
 
 #include "snap7.h"
-#include "npcap_dyn.h"
+#include "npcap_dyn.h"   // pulls in pcap.h -> winsock2.h; must come before windows.h
 #include "profinet_scan.h"
 #include "logger.h"
+#include "io_address.h"
+#include "channel_program.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN // keep windows.h from dragging in legacy winsock.h
+#endif
+#include <windows.h> // Sleep()
 
 namespace {
 
@@ -97,24 +105,6 @@ bool ConnectToPlc(const std::string &ip, S7Object &client, bool &connected) {
     return true;
 }
 
-// Parses an address like "Q0.3" (the leading 'Q' is optional) into byte/bit.
-bool ParseIoAddress(const std::string &raw, int &byteIdx, int &bitIdx) {
-    std::string s = Trim(raw);
-    if (!s.empty() && (s[0] == 'Q' || s[0] == 'q')) {
-        s = s.substr(1);
-    }
-    size_t dot = s.find('.');
-    if (dot == std::string::npos) return false;
-
-    try {
-        byteIdx = std::stoi(s.substr(0, dot));
-        bitIdx = std::stoi(s.substr(dot + 1));
-    } catch (...) {
-        return false;
-    }
-    return byteIdx >= 0 && bitIdx >= 0 && bitIdx <= 7;
-}
-
 // Reads and prints the state of every onboard digital input and output.
 void ShowPortStates(S7Object client) {
     unsigned char inputs[kInputBytes] = {0};
@@ -149,6 +139,85 @@ void ShowPortStates(S7Object client) {
             bool state = (outputs[b] >> bit) & 1;
             std::printf("  Q%d.%d = %s\n", b, bit, state ? "True" : "False");
         }
+    }
+}
+
+// Repeatedly re-writes a single output bit and immediately reads it back,
+// for `durationSec`, tracking what fraction of checks actually held the
+// requested value. Snap7 (and the S7 protocol as used here) has no genuine
+// "force" telegram -- a single write can only ever compete with, not
+// override, a running user program. This quantifies that contention instead
+// of guessing at it: a low match rate means something on the CPU is
+// actively overwriting the bit faster than we can hold it; a high rate
+// means the bit is free and an earlier failure was likely transient.
+void HoldAndMonitor(S7Object client, int byteIdx, int bitIdx, bool value, double durationSec) {
+    std::printf("\nHolding Q%d.%d = %s for %.1fs, checking for interference"
+                " (Ctrl+C to abort)...\n", byteIdx, bitIdx, value ? "True" : "False", durationSec);
+    logger::Log("HOLD -> area=PA byte=" + std::to_string(byteIdx) + " bit=" +
+                std::to_string(bitIdx) + " value=" + std::string(value ? "True" : "False") +
+                " duration_s=" + std::to_string(durationSec));
+
+    const auto start = std::chrono::steady_clock::now();
+    auto lastPrint = start;
+    long attempts = 0, matches = 0;
+
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start).count();
+        if (elapsed >= durationSec) break;
+
+        unsigned char byteVal = 0;
+        int rc = Cli_ReadArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &byteVal);
+        if (rc == 0) {
+            unsigned char newByteVal = byteVal;
+            if (value) {
+                newByteVal |= static_cast<unsigned char>(1 << bitIdx);
+            } else {
+                newByteVal &= static_cast<unsigned char>(~(1 << bitIdx));
+            }
+            rc = Cli_WriteArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &newByteVal);
+        }
+
+        unsigned char verifyVal = 0;
+        int vrc = Cli_ReadArea(client, S7AreaPA, 0, byteIdx, 1, S7WLByte, &verifyVal);
+        ++attempts;
+        bool matched = (rc == 0) && (vrc == 0) &&
+                       (static_cast<bool>((verifyVal >> bitIdx) & 1) == value);
+        if (matched) ++matches;
+
+        now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - lastPrint).count() >= 1.0) {
+            double pct = attempts ? 100.0 * matches / attempts : 0.0;
+            std::printf("  %.0fs elapsed: %ld/%ld checks matched (%.0f%%)\n",
+                        elapsed, matches, attempts, pct);
+            logger::Log("HOLD status elapsed_s=" + std::to_string(elapsed) +
+                        " attempts=" + std::to_string(attempts) +
+                        " matches=" + std::to_string(matches));
+            lastPrint = now;
+        }
+
+        Sleep(50);
+    }
+
+    double pct = attempts ? 100.0 * matches / attempts : 0.0;
+    std::printf("\nHold finished: %ld/%ld checks matched the requested value (%.1f%%).\n",
+                matches, attempts, pct);
+    logger::Log("HOLD <- attempts=" + std::to_string(attempts) + " matches=" +
+                std::to_string(matches) + " pct=" + std::to_string(pct));
+
+    if (pct > 95.0) {
+        std::printf("This output held reliably -- the earlier mismatch was likely a one-off\n"
+                    "race with the CPU's scan cycle rather than active interference.\n");
+    } else if (pct < 5.0) {
+        std::printf("This output is being overwritten on essentially every scan cycle by\n"
+                    "something running on the CPU -- almost certainly the loaded user\n"
+                    "program recomputing this whole output byte. A plain S7 write cannot\n"
+                    "override that. To actually hold it you'd need TIA Portal's Force/Modify\n"
+                    "table (a proprietary telegram snap7 doesn't implement), or to free this\n"
+                    "address in the program logic itself.\n");
+    } else {
+        std::printf("This output is intermittently overwritten -- likely conditional logic in\n"
+                    "the running program only drives it part of the time.\n");
     }
 }
 
@@ -238,7 +307,173 @@ void SetOutputPort(S7Object client) {
                     "writes. Check logs/ for the exact request/response sequence.\n");
         logger::Log("WRITE MISMATCH: requested=" + std::string(value ? "True" : "False") +
                     " actual=" + std::string(actual ? "True" : "False"));
+
+        std::printf("\nHold and monitor this bit to quantify the interference? (y/N): ");
+        if (!std::getline(std::cin, line)) return;
+        line = Trim(line);
+        if (line == "y" || line == "Y") {
+            std::printf("Hold duration in seconds [10]: ");
+            if (!std::getline(std::cin, line)) return;
+            line = Trim(line);
+            double durationSec = 10.0;
+            if (!line.empty()) {
+                try {
+                    durationSec = std::stod(line);
+                } catch (...) {
+                    std::printf("Invalid duration, using 10s.\n");
+                }
+            }
+            HoldAndMonitor(client, byteIdx, bitIdx, value, durationSec);
+        }
     }
+}
+
+// Applies every channel state from a parsed program file: writes each one,
+// then (if holdSeconds > 0) repeatedly re-asserts all of them together while
+// tracking how often each one actually holds -- the multi-channel version of
+// the same interference check HoldAndMonitor does for a single bit. There is
+// still no genuine "force" here (see HoldAndMonitor's comment); this is
+// meant to reveal, per channel, which ones are free to set and which are
+// being fought by something already running on the CPU.
+void RunChannelProgram(S7Object client, const std::vector<ChannelState> &states, double holdSeconds) {
+    std::printf("\nApplying %zu channel state(s):\n", states.size());
+    logger::Log("PROGRAM -> applying " + std::to_string(states.size()) +
+                " channel state(s), hold_s=" + std::to_string(holdSeconds));
+
+    for (const auto &st : states) {
+        if (st.byteIdx >= kOutputBytes) {
+            std::printf("  %-8s SKIPPED (byte %d out of range for this CPU's outputs Q0-Q%d)\n",
+                        st.rawAddress.c_str(), st.byteIdx, kOutputBytes - 1);
+            logger::Log("PROGRAM SKIP " + st.rawAddress + " out of range");
+            continue;
+        }
+
+        unsigned char byteVal = 0;
+        int rc = Cli_ReadArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &byteVal);
+        if (rc != 0) {
+            std::printf("  %-8s FAILED to read (%s)\n", st.rawAddress.c_str(), PrintCliError(rc).c_str());
+            logger::Log("PROGRAM " + st.rawAddress + " read-before rc=" + std::to_string(rc));
+            continue;
+        }
+
+        unsigned char newByteVal = byteVal;
+        if (st.value) {
+            newByteVal |= static_cast<unsigned char>(1 << st.bitIdx);
+        } else {
+            newByteVal &= static_cast<unsigned char>(~(1 << st.bitIdx));
+        }
+
+        rc = Cli_WriteArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &newByteVal);
+        logger::Log("PROGRAM WRITE " + st.rawAddress + "=" + (st.value ? "True" : "False") +
+                    " old=[" + logger::Hex(&byteVal, 1) + "] new=[" + logger::Hex(&newByteVal, 1) +
+                    "] rc=" + std::to_string(rc));
+        if (rc != 0) {
+            std::printf("  %-8s FAILED to write (%s)\n", st.rawAddress.c_str(), PrintCliError(rc).c_str());
+            continue;
+        }
+        std::printf("  %-8s = %-5s written\n", st.rawAddress.c_str(), st.value ? "True" : "False");
+    }
+
+    if (holdSeconds <= 0.0) {
+        std::printf("\nDone (single pass, no hold). Use option 4 to check the resulting states,\n"
+                    "or re-run with a hold duration if a value doesn't stick.\n");
+        return;
+    }
+
+    std::printf("\nHolding and re-asserting all %zu channel(s) for %.1fs...\n",
+                states.size(), holdSeconds);
+    logger::Log("PROGRAM HOLD -> " + std::to_string(states.size()) + " channel(s) for " +
+                std::to_string(holdSeconds) + "s");
+
+    std::vector<long> matches(states.size(), 0);
+    long attempts = 0;
+    const auto start = std::chrono::steady_clock::now();
+    auto lastPrint = start;
+
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start).count();
+        if (elapsed >= holdSeconds) break;
+
+        ++attempts;
+        for (size_t i = 0; i < states.size(); ++i) {
+            const ChannelState &st = states[i];
+            if (st.byteIdx >= kOutputBytes) continue;
+
+            unsigned char byteVal = 0;
+            int rc = Cli_ReadArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &byteVal);
+            if (rc == 0) {
+                unsigned char newByteVal = byteVal;
+                if (st.value) {
+                    newByteVal |= static_cast<unsigned char>(1 << st.bitIdx);
+                } else {
+                    newByteVal &= static_cast<unsigned char>(~(1 << st.bitIdx));
+                }
+                rc = Cli_WriteArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &newByteVal);
+            }
+
+            unsigned char verifyVal = 0;
+            int vrc = Cli_ReadArea(client, S7AreaPA, 0, st.byteIdx, 1, S7WLByte, &verifyVal);
+            bool matched = (rc == 0) && (vrc == 0) &&
+                           (static_cast<bool>((verifyVal >> st.bitIdx) & 1) == st.value);
+            if (matched) ++matches[i];
+        }
+
+        now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - lastPrint).count() >= 1.0) {
+            std::printf("  %.0fs elapsed, %ld pass(es) so far\n", elapsed, attempts);
+            lastPrint = now;
+        }
+
+        Sleep(50);
+    }
+
+    std::printf("\nHold finished after %ld pass(es):\n", attempts);
+    for (size_t i = 0; i < states.size(); ++i) {
+        double pct = attempts ? 100.0 * matches[i] / attempts : 0.0;
+        std::printf("  %-8s = %-5s held %.1f%% of checks%s\n",
+                    states[i].rawAddress.c_str(), states[i].value ? "True" : "False", pct,
+                    pct < 50.0 ? "  <-- likely overridden by a running program" : "");
+        logger::Log("PROGRAM HOLD RESULT " + states[i].rawAddress + " matches=" +
+                    std::to_string(matches[i]) + "/" + std::to_string(attempts));
+    }
+}
+
+// Prompts for a program file path and hold duration, loads it, and runs it.
+void RunProgramFromFile(S7Object client) {
+    std::printf("\nProgram file path [program.txt]: ");
+    std::string line;
+    if (!std::getline(std::cin, line)) return;
+    line = Trim(line);
+    std::string path = line.empty() ? "program.txt" : line;
+
+    std::vector<ChannelState> states;
+    std::string error;
+    if (!ParseChannelProgram(path, states, error)) {
+        std::printf("Failed to load program: %s\n", error.c_str());
+        logger::Log("PROGRAM LOAD FAILED path=" + path + " error=" + error);
+        return;
+    }
+
+    std::printf("Loaded %zu channel state(s) from %s:\n", states.size(), path.c_str());
+    for (const auto &st : states) {
+        std::printf("  %s = %s\n", st.rawAddress.c_str(), st.value ? "True" : "False");
+    }
+    logger::Log("PROGRAM LOAD OK path=" + path + " count=" + std::to_string(states.size()));
+
+    std::printf("\nHold/re-assert duration in seconds (0 = apply once, no hold) [10]: ");
+    if (!std::getline(std::cin, line)) return;
+    line = Trim(line);
+    double holdSeconds = 10.0;
+    if (!line.empty()) {
+        try {
+            holdSeconds = std::stod(line);
+        } catch (...) {
+            std::printf("Invalid duration, using 10s.\n");
+        }
+    }
+
+    RunChannelProgram(client, states, holdSeconds);
 }
 
 // Runs a PROFINET DCP Identify-All scan (same discovery PRONETA's network
@@ -339,10 +574,12 @@ void PrintMenu(const std::string &ip, bool connected) {
                 "  3) Scan network for PROFINET devices\n"
                 "  4) Show I/O port states%s\n"
                 "  5) Set an output port (True/False)%s\n"
+                "  6) Load & run a channel-state program (.txt)%s\n"
                 "  0) Exit\n"
                 "Choice: ",
                 ip.c_str(),
                 connected ? "connected" : "not connected",
+                connected ? "" : "  (connect first)",
                 connected ? "" : "  (connect first)",
                 connected ? "" : "  (connect first)");
 }
@@ -389,6 +626,12 @@ int main(int argc, char *argv[]) {
                 std::printf("Not connected -- use option 2 first.\n");
             } else {
                 SetOutputPort(client);
+            }
+        } else if (line == "6") {
+            if (!connected) {
+                std::printf("Not connected -- use option 2 first.\n");
+            } else {
+                RunProgramFromFile(client);
             }
         } else if (line == "0" || line == "q" || line == "quit" || line == "exit") {
             break;
