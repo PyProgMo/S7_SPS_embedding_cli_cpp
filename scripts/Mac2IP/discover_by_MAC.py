@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Discover a Siemens S7-1200 PLC via PROFINET DCP by its MAC address,
-print its current IP configuration, and (if needed) assign it a new
-IP address so it can be reached over the local Ethernet link.
+print its current IP configuration, and (if requested) permanently
+reassign its IP address so it can be reached over the local Ethernet link.
 
 Requirements:
     pip install python-snap7[discovery]
@@ -11,12 +11,13 @@ Requirements:
     is required for DCP broadcasts.
 
 Usage:
-    1. Fill in TARGET_MAC below (run once with discover-only to find it if unknown).
+    1. Fill in TARGET_MAC below (run once with no --new-ip to find it if unknown).
     2. Fill in LOCAL_INTERFACE_IP with your Ethernet adapter's own IP.
-    3. Set NEW_IP_CONFIG to whatever you want the PLC to have.
-    4. Run: python assign_plc_ip.py
+    3. Run: python discover_by_MAC.py                       (discover/identify only)
+       Or:  python discover_by_MAC.py --new-ip 192.168.2.10  (reassign the IP)
 """
 
+import argparse
 import sys
 import time
 
@@ -24,9 +25,8 @@ from snap7.discovery import discover
 from pnio_dcp import DCP, DcpTimeoutError
 
 # --- Configuration -------------------------------------------------------
-LOCAL_INTERFACE_IP = "192.168.0.2"        # your PC's Ethernet adapter IP
-TARGET_MAC = "xx:xx:xx:xx:xx:xx"          # MAC address of the PLC (from a first discover run)
-NEW_IP_CONFIG = ["192.168.0.1", "255.255.255.0", "0.0.0.0"]  # [ip, netmask, gateway]
+LOCAL_INTERFACE_IP = "192.168.2.105"        # your PC's Ethernet adapter IP
+TARGET_MAC = "00:1c:06:19:5d:35"          # MAC address of the PLC (from a first discover run)
 DISCOVERY_TIMEOUT = 5.0
 # --------------------------------------------------------------------------
 
@@ -55,19 +55,92 @@ def find_device_by_mac(mac: str, local_ip: str, timeout: float):
     return next((d for d in devices if d.mac.lower() == mac.lower()), None)
 
 
-def assign_ip(mac: str, local_ip: str, ip_config: list):
-    """Assign a new IP configuration to the device with the given MAC address."""
-    dcp = DCP(ip=local_ip)
+def set_plc_ip(mac_address: str, new_ip: str,
+                subnet_mask: str = "255.255.255.0",
+                gateway: str = "0.0.0.0",
+                permanent: bool = True) -> None:
+    """
+    Reassign a PROFINET device's IP configuration via DCP, logging a
+    before/after record and handling the case where the device doesn't
+    respond in time.
+
+    Note: if the new IP reverts after a power cycle, the CPU's hardware
+    config in TIA Portal most likely has the PROFINET interface set to
+    "IP address set in the project" rather than "IP address set directly
+    at the device" -- that setting re-pushes its own configured IP at every
+    boot/config-download and silently overrides whatever DCP sets here.
+    That's a TIA Portal project setting to fix (re-download hardware config
+    after switching it), not something this script can work around.
+    """
+    dcp = DCP(ip=LOCAL_INTERFACE_IP)
+
     try:
-        dcp.set_ip_address(mac, ip_config)
+        before = dcp.identify(mac_address)
+        print(f"Current configuration for {mac_address}: "
+              f"name={before.name_of_station or '(none)'} IP={before.IP or '(none)'}")
     except DcpTimeoutError:
-        print(f"Device {mac} did not respond to the set-IP request.")
-        sys.exit(1)
-    print(f"Requested IP change for {mac} -> {ip_config[0]} "
-          f"(netmask {ip_config[1]}, gateway {ip_config[2]})")
+        print(f"{mac_address} did not respond to identify -- continuing anyway.")
+
+    print(f"Setting {mac_address} -> {new_ip} (netmask {subnet_mask}, gateway {gateway}, "
+          f"{'permanent' if permanent else 'temporary'})...")
+    try:
+        response = dcp.set_ip_address(mac_address, [new_ip, subnet_mask, gateway], permanent)
+    except DcpTimeoutError:
+        print(f"{mac_address} did not respond to the set-IP request within the timeout.")
+        return
+
+    # set_ip_address() does NOT raise on a rejected request -- it returns a
+    # ResponseCode that evaluates to False (e.g. "Code 06: In operation, SET
+    # not possible" if the CPU is actively running). Ignoring this return
+    # value makes a rejection look identical to success.
+    if not response:
+        print(f"Device rejected the IP change: {response.get_message()}")
+        if response.code == 6:
+            print("The CPU is currently running (\"in operation\") -- PROFINET devices "
+                  "commonly refuse DCP address changes while actively running, as a safety "
+                  "measure. Stop the CPU first (e.g. SPScomm's \"Stop CPU\" option, or in "
+                  "TIA Portal), retry this, then start it again.")
+        elif response.code == 3:
+            print("This usually means the CPU's PROFINET interface has \"IP address is set "
+                  "in the project\" selected in TIA Portal (Device configuration -> PROFINET "
+                  "interface -> Ethernet addresses), which locks out external DCP writes to "
+                  "the IP parameter entirely. Switch it to \"IP address is set directly at "
+                  "the device\", re-download the hardware config, then retry.")
+        return
+
+    time.sleep(2)  # give the device a moment to apply the new configuration
+
+    try:
+        confirmed_ip = dcp.get_ip_address(mac_address)
+    except DcpTimeoutError:
+        print(f"Set request was sent, but {mac_address} did not respond to the "
+              f"verification read -- check manually.")
+        return
+
+    print(f"Confirmed: {mac_address} is now at {confirmed_ip} (requested {new_ip}).")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Discover a Siemens PROFINET device by MAC and, optionally, "
+                    "permanently reassign its IP address."
+    )
+    parser.add_argument("--new-ip", metavar="IP",
+                        help="If given, reassign TARGET_MAC to this IP instead of just "
+                             "discovering/identifying it.")
+    parser.add_argument("--netmask", default="255.255.255.0",
+                        help="Subnet mask to set alongside --new-ip (default: %(default)s)")
+    parser.add_argument("--gateway", default="0.0.0.0",
+                        help="Gateway to set alongside --new-ip (default: %(default)s)")
+    parser.add_argument("--temporary", action="store_true",
+                        help="Store --new-ip only until the next power cycle, instead of "
+                             "permanently (default: permanent).")
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
+
     if TARGET_MAC.lower() == "xx:xx:xx:xx:xx:xx":
         print("Set TARGET_MAC at the top of this script first — running discovery only.\n")
         discover_devices = discover(ip=LOCAL_INTERFACE_IP, timeout=DISCOVERY_TIMEOUT)
@@ -86,14 +159,16 @@ def main():
 
     print(f"\nFound target device: {device.name} at IP={device.ip or '(none)'}")
 
-    if device.ip == NEW_IP_CONFIG[0]:
+    if not args.new_ip:
+        return  # discover/identify-only run
+
+    if device.ip == args.new_ip:
         print("Device already has the desired IP address — nothing to do.")
         return
 
-    print("Assigning new IP configuration...")
-    assign_ip(TARGET_MAC, LOCAL_INTERFACE_IP, NEW_IP_CONFIG)
+    print("\nAssigning new IP configuration...")
+    set_plc_ip(TARGET_MAC, args.new_ip, args.netmask, args.gateway, permanent=not args.temporary)
 
-    time.sleep(2)  # give the PLC a moment to apply the new config
     print("\nVerifying new configuration...")
     find_device_by_mac(TARGET_MAC, LOCAL_INTERFACE_IP, DISCOVERY_TIMEOUT)
 

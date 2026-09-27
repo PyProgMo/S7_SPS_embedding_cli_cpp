@@ -24,9 +24,9 @@ from snap7.discovery import discover
 from pnio_dcp import DCP, DcpTimeoutError
 
 # --- Configuration -------------------------------------------------------
-LOCAL_INTERFACE_IP = "192.168.0.2"        # your PC's Ethernet adapter IP
+LOCAL_INTERFACE_IP = "192.168.2.105"        # your PC's Ethernet adapter IP
 TARGET_MAC = "00:1c:06:19:5d:35"          # MAC address of the PLC (from a first discover run)
-NEW_IP_CONFIG = ["192.168.0.1", "255.255.255.0", "0.0.0.0"]  # [ip, netmask, gateway]
+NEW_IP_CONFIG = ["192.168.2.10", "255.255.255.0", "0.0.0.0"]  # [ip, netmask, gateway]
 DISCOVERY_TIMEOUT = 5.0
 # --------------------------------------------------------------------------
 
@@ -59,10 +59,30 @@ def assign_ip(mac: str, local_ip: str, ip_config: list):
     """Assign a new IP configuration to the device with the given MAC address."""
     dcp = DCP(ip=local_ip)
     try:
-        dcp.set_ip_address(mac, ip_config)
+        response = dcp.set_ip_address(mac, ip_config)
     except DcpTimeoutError:
         print(f"Device {mac} did not respond to the set-IP request.")
         sys.exit(1)
+
+    # set_ip_address() does NOT raise on a rejected request -- it returns a
+    # ResponseCode that evaluates to False (e.g. "Code 06: In operation, SET
+    # not possible" if the CPU is actively running). Ignoring this return
+    # value makes a rejection look identical to success.
+    if not response:
+        print(f"Device rejected the IP change: {response.get_message()}")
+        if response.code == 6:
+            print("The CPU is currently running (\"in operation\") -- PROFINET devices "
+                  "commonly refuse DCP address changes while actively running, as a safety "
+                  "measure. Stop the CPU first (e.g. SPScomm's \"Stop CPU\" option, or in "
+                  "TIA Portal), retry this, then start it again.")
+        elif response.code == 3:
+            print("This usually means the CPU's PROFINET interface has \"IP address is set "
+                  "in the project\" selected in TIA Portal (Device configuration -> PROFINET "
+                  "interface -> Ethernet addresses), which locks out external DCP writes to "
+                  "the IP parameter entirely. Switch it to \"IP address is set directly at "
+                  "the device\", re-download the hardware config, then retry.")
+        sys.exit(1)
+
     print(f"Requested IP change for {mac} -> {ip_config[0]} "
           f"(netmask {ip_config[1]}, gateway {ip_config[2]})")
 
