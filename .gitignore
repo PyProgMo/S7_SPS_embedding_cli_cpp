@@ -42,3 +42,7 @@ logs/
 !.vscode/extensions.json
 Thumbs.db
 Desktop.ini
+
+# --- Generated scan output (from the network scan scripts) ----------------
+scan_results.txt
+profinet_devices.txt
