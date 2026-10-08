@@ -14,5 +14,9 @@ cmake --build "$BUILD_DIR"
 echo
 echo "Built: $BUILD_DIR/SPScomm.exe"
 
-# cp program.txt into the same dir as the .exe file
-mv program.txt ./build/.
+# Copy the runtime input file next to the executable without removing the source.
+cmake -E copy_if_different \
+    "$SCRIPT_DIR/program.txt" \
+    "$BUILD_DIR/program.txt"
+
+echo "Copied: $BUILD_DIR/program.txt"
