@@ -161,9 +161,10 @@ def arp_owner(ip: str, src_ip: str | None) -> str | None:
     return None
 
 
-def tcp_open(ip: str, port: int = S7_PORT, timeout: float = 3.0) -> bool:
+def tcp_open(ip: str, port: int = S7_PORT, timeout: float = 3.0, source: str | None = None) -> bool:
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
+        src = (source, 0) if source else None
+        with socket.create_connection((ip, port), timeout=timeout, source_address=src):
             return True
     except OSError:
         return False
@@ -375,9 +376,11 @@ def check_ping(plc_ip: str, do_ping: bool) -> Check:
     return c
 
 
-def check_tcp(plc_ip: str) -> tuple[Check, bool]:
+def check_tcp(plc_ip: str, source: str | None = None) -> tuple[Check, bool]:
     c = Check(f"S7comm port {plc_ip}:{S7_PORT}")
-    ok = tcp_open(plc_ip, S7_PORT)
+    ok = tcp_open(plc_ip, S7_PORT, source=source)
+    if source:
+        c.add(f"Connecting from this PC's {source} (same subnet as the PLC).")
     if ok:
         c.set(OK, f"TCP {S7_PORT} is open -- S7comm tools can connect")
     else:
@@ -489,13 +492,13 @@ def capability_matrix(deps: dict, dcp_found, in_subnet: bool, tcp_ok: bool,
 
     # Discovery by MAC (layer 2) -- independent of IP subnet.
     if not have_dcp:
-        rows.append(("Discover PLC by MAC", "Mac2IP/simple_discover_by_MAC.py, Mac2IP/discover_by_MAC.py",
+        rows.append(("Discover PLC by MAC", "Mac2IP/simple_discover_by_MAC.py",
                      FAIL, "pnio-dcp not installed"))
     elif dcp_found:
-        rows.append(("Discover PLC by MAC", "Mac2IP/simple_discover_by_MAC.py, Mac2IP/discover_by_MAC.py",
+        rows.append(("Discover PLC by MAC", "Mac2IP/simple_discover_by_MAC.py",
                      OK, "PLC answered DCP on the wire"))
     else:
-        rows.append(("Discover PLC by MAC", "Mac2IP/simple_discover_by_MAC.py, Mac2IP/discover_by_MAC.py",
+        rows.append(("Discover PLC by MAC", "Mac2IP/simple_discover_by_MAC.py",
                      WARN, "library OK, but the PLC did not answer DCP (see that check)"))
 
     # Read identity.
@@ -528,9 +531,9 @@ def capability_matrix(deps: dict, dcp_found, in_subnet: bool, tcp_ok: bool,
                  "already in the subnet -- not needed now" if in_subnet
                  else "needed: run it in an elevated terminal to add 192.168.5.60"))
 
-    # Change the PLC's IP -- known-locked.
-    rows.append(("Change the PLC's IP", "setIP/set_plc_ip.py",
-                 FAIL, "PLC IP is locked by its TIA project (DCP code 03) -- not usable here"))
+    # Change the PLC's IP -- known-locked; no script can do it (removed set_plc_ip.py).
+    rows.append(("Change the PLC's IP", "(not possible on this PLC)",
+                 FAIL, "IP is locked by the TIA project (DCP code 03); only TIA Portal can change it"))
     return rows
 
 
@@ -660,7 +663,7 @@ def main() -> int:
     checks.append(check_arp(args.ip, src_ip, plc_mac))
     checks.append(check_ping(args.ip, do_ping=not args.no_ping))
 
-    tcp_check, tcp_ok = check_tcp(args.ip)
+    tcp_check, tcp_ok = check_tcp(args.ip, source=subnet_ip)
     checks.append(tcp_check)
 
     cpu_state = None

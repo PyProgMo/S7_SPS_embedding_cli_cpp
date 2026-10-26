@@ -7,12 +7,20 @@ Requirements:
     pip install python-snap7
 
 Usage:
-    1. Fill in PLC_IP / RACK / SLOT below (see assign_plc_ip.py if the PLC's
-       IP isn't set yet, or lan_scanner.py / big_range_scanner.py to find it).
+    1. Make sure this PC is in the PLC's subnet (scripts/setIP/reach_plc.py), and
+       that PLC_IP below matches the PLC (scripts/Mac2IP/simple_discover_by_MAC.py
+       prints the PLC's current IP).
     2. Run: python get_plc_info.py
 """
 
+import os
 import sys
+
+# Reuse the shared, source-bound connect() from program_io/plc_io.py so this tool
+# talks to the PLC from this PC's address in the PLC's subnet (and fails fast with
+# guidance if this PC isn't in that subnet yet).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "program_io"))
+import plc_io  # noqa: E402
 
 from snap7.client import Client
 from snap7.error import S7Error
@@ -68,18 +76,11 @@ def print_cpu_state(client: Client):
 
 
 def main():
-    client = Client()
     print(f"Connecting to {PLC_IP} (rack {RACK}, slot {SLOT}, port {TCP_PORT})...")
     try:
-        client.connect(PLC_IP, RACK, SLOT, TCP_PORT)
-    except (S7Error, RuntimeError) as exc:
-        print(f"Connection failed: {exc}")
-        print("Check the IP/rack/slot, that the PLC is reachable, and that")
-        print("nothing else (e.g. TIA Portal) is already using the connection.")
-        sys.exit(1)
-
-    if not client.get_connected():
-        print("Connection could not be established.")
+        client = plc_io.connect(PLC_IP)
+    except plc_io.PlcUnreachable as exc:
+        print(exc)
         sys.exit(1)
 
     print("Connected.\n")

@@ -25,6 +25,7 @@ Requirements:
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import socket
 from dataclasses import dataclass
@@ -110,27 +111,71 @@ def program_to_output_image(channels: list[Channel]) -> bytearray:
     return image
 
 
-def connect(ip: str = DEFAULT_IP, *, preflight: bool = True) -> Client:
-    """Open an S7 connection (rack 0, slot 1). Raises PlcUnreachable with
-    actionable guidance if the S7comm port can't even be reached."""
+def source_ip_for(dest_ip: str, prefix: int = 24) -> str | None:
+    """This PC's own IPv4 address that sits in the same subnet as `dest_ip`, or None.
+
+    Asks the OS which local address it would use to reach `dest_ip` (a UDP route
+    lookup -- no packet is sent) and only accepts it when it genuinely shares
+    `dest_ip`'s subnet, i.e. the PLC is directly reachable from that address.
+    You cannot "pretend" to hold an address the machine doesn't have, so this is
+    exactly the address reach_plc.py adds (e.g. 192.168.5.60) when it worked.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((dest_ip, 9))          # route lookup only; nothing is sent
+            src = probe.getsockname()[0]
+    except OSError:
+        return None
+    try:
+        net = ipaddress.ip_network(f"{dest_ip}/{prefix}", strict=False)
+        return src if ipaddress.ip_address(src) in net else None
+    except ValueError:
+        return None
+
+
+def connect(ip: str = DEFAULT_IP, *, preflight: bool = True, source_ip: str | None = None) -> Client:
+    """Open an S7 connection (rack 0, slot 1) to the PLC, FROM this PC's address in
+    the PLC's subnet. Raises PlcUnreachable with actionable guidance otherwise.
+
+    Why the source address matters here:
+        The PLC's IP is fixed (locked by its TIA project) and its gateway is
+        0.0.0.0, so it only answers devices inside its own subnet (192.168.5.0/24).
+        This PC reaches it by holding a SECOND address in that subnet alongside its
+        normal/internet address (see scripts/setIP/reach_plc.py). We bind the
+        connection's source to that in-subnet address, so the traffic always leaves
+        from the PLC's network -- the "behave as if this PC lived in the PLC's
+        network" approach -- and so we fail fast, with a clear message, when this PC
+        is not in that subnet yet (rather than hanging or sourcing from the wrong
+        adapter). snap7 itself then routes the S7 session out the same interface,
+        because 192.168.5.70 is directly connected on it.
+    """
+    src = source_ip or source_ip_for(ip)
+    if src is None:
+        raise PlcUnreachable(
+            f"This PC has no address in the PLC's subnet, so it cannot reach {ip}.\n"
+            f"  - Give it one (kept alongside your normal/internet address) with:\n"
+            f"      python scripts/setIP/reach_plc.py\n"
+            f"  - Check the PLC's current IP (DCP works across subnets, S7comm does not):\n"
+            f"      python scripts/Mac2IP/simple_discover_by_MAC.py\n"
+            f"  - Or pass the local address to use explicitly: connect(ip, source_ip=...)."
+        )
+    print(f"  Using this PC's {src} as the source (same subnet as the PLC at {ip}).")
+
     if preflight:
         try:
-            with socket.create_connection((ip, TCP_PORT), timeout=3):
+            with socket.create_connection((ip, TCP_PORT), timeout=3, source_address=(src, 0)):
                 pass
         except OSError as exc:
             raise PlcUnreachable(
-                f"Cannot reach the PLC at {ip}:{TCP_PORT} ({exc}).\n"
-                f"  - Is this PC in the same IP subnet as the PLC? Run\n"
-                f"      python scripts/Mac2IP/simple_discover_by_MAC.py\n"
-                f"    to see the PLC's current IP (DCP works across subnets, S7comm does not).\n"
-                f"  - If it is in a different subnet, move it with scripts/Mac2IP/discover_by_MAC.py --auto,\n"
-                f"    or give this PC a second IP in the PLC's subnet."
+                f"This PC is in the PLC's subnet (as {src}) but {ip}:{TCP_PORT} did not answer ({exc}).\n"
+                f"  - Is the PLC powered on and on the same switch?\n"
+                f"  - Is anything else (e.g. TIA Portal) already holding the S7 connection?"
             ) from exc
 
     client = Client()
     client.connect(ip, RACK, SLOT, TCP_PORT)
     if not client.get_connected():
-        raise PlcUnreachable(f"Connected socket to {ip} but the S7 session did not establish.")
+        raise PlcUnreachable(f"Reached {ip}:{TCP_PORT} from {src} but the S7 session did not establish.")
     return client
 
 
