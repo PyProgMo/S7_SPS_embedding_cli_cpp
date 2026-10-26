@@ -46,3 +46,4 @@ Desktop.ini
 # --- Generated scan output (from the network scan scripts) ----------------
 scan_results.txt
 profinet_devices.txt
+scripts/diagnostics/reports/
